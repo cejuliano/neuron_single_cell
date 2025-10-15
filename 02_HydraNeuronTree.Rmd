@@ -1,0 +1,985 @@
+---
+title: "Hydra Neuron URD"
+author: "Michael Nunneley"
+date: "2025-08-29"
+linestretch: 0.5
+output: html_document
+---
+
+```{r knit_prep, echo=F, results='hide', message=F, warning=F}
+library("knitr")
+opts_chunk$set(tidy.opts=list(width.cutoff=80),tidy=TRUE, dev="png", dpi=150)
+```
+
+# Setup
+
+```{r libraries}
+#Load Required libraries:
+library(Seurat)
+library(URD)
+
+#set working directory and make output folders
+setwd("/data/CSD/2025-Juliano-Collab/hydra_neuron_URD_Rmarkdown")
+
+dir.create("Figures/")
+dir.create("Figures/QC")
+dir.create("objects")
+
+
+# Using the same colors that were used to plot the seurat umap:
+curated.ident.colors <- c(ec4A = "#D3813C", ec4B = "#798E96", ec2 = "#8E486D",`ec2 precursor` = "#60BAE8", ec1B = "#4B8256",
+                          ec1E = "#E57BA2", ec1C = "#8F9BCD", ec1D = "#727E99", ec1A = "#69C3C4", `ec1 precursor` = "#B887BB",
+                          progen2 = "#7D5DA8", ISC = "#DF7CB0", progen1 = "#F3BA67", ec5 = "#968FC4", `en precursor` = "#B95650",
+                          en1 = "#578EC9", en3 = "#88B759", en2 = "#E8887C", ec3A = "#60B960", ec3B = "#5C4081", ec3C = "#62C5D9",
+                          `ec3 precursor` = "#CC81B4")
+
+#set seed:
+set.seed(1212)
+```
+
+# Load data
+
+Here we are loading the seurat object that contains the gene expression, batch corrected expression, meta data, and umap coordinants. We are also loading the initial URD object that did not include ec1E, ec1C, or ec1D, but contains the NMF module information. 
+
+```{r load-data}
+seurat.obj <- readRDS("/data/CSD/Michael/hydra/objects/hydra.neuron.seurat_updated.HML.RDS")
+old.urd.obj <- readRDS("/data/CSD/Michael/hydra/objects/hydra.neuron.urd_updated.idents.RDS")
+```
+
+# Subset data
+
+ec1B is a very large cluster with few differences between subclusters. We are therefore subsetting it to reduce the number of cells. However, unlike the initial URD run, we will be including ec1E, ec1C, and ec1D in this object.
+
+```{r subset-seurat-obj}
+#plot the cells by ident and sub-clusters
+DimPlot(seurat.obj, group.by = "curatedIdent", label = T, repel = T) + NoLegend() + NoAxes() |
+DimPlot(seurat.obj, group.by = "seurat_clusters", label = T, repel = T) + NoLegend() + NoAxes()
+
+#Removing seurat clusters 1,9,16 to only keep part of the ec1B sub-cluster
+cells.exclude <- rownames(seurat.obj@meta.data[seurat.obj@meta.data$seurat_clusters %in% c("1", "9", "16"),])
+cells.keep <- setdiff(rownames(seurat.obj@meta.data), cells.exclude)
+
+#Subset the seurat object:
+seurat.obj <- subset(seurat.obj, cells = cells.keep)
+```
+
+# Create URD object
+
+URD currently does not include a function to convert the new seurat object layouts to an URD object. We are currently working on URD V2 that will include this function, but in the meantime we make a new function to convert the subsetted seurat object to an URD object. To deal with batch effects, we will create the trajectory using seurat's batch corrected "integrated" data. After creating the trajectory, we will change the gene expression slot of the URD object back to the SCT normalized data. We are also going to remove Dropseq data that has very large batch effects.
+
+```{r create-urd-obj}
+#Need to use a new function to create URD object from the new Seurat object format.
+SeuratToURDv3 <- function(seurat.object) {
+  if (requireNamespace("Seurat", quietly = TRUE)) {
+    # Create an empty URD object
+    ds <- new("URD")
+
+    # Copy over data
+    ds@logupx.data <- as(as.matrix(seurat.object@assays$RNA@data), "dgCMatrix")
+    if(!any(dim(seurat.object@assays$RNA@counts) == 0)) ds@count.data <- as(as.matrix(seurat.object@assays$RNA@counts[rownames(seurat.object@assays$RNA@data), colnames(seurat.object@assays$RNA@data)]), "dgCMatrix")
+
+    # Copy over metadata
+    ## TO DO - grab kmeans clustering info
+    get.data <- NULL
+    if (.hasSlot(seurat.object, "data.info")) {
+      get.data <- as.data.frame(seurat.object@assays$RNA@data.info)
+    } else if (.hasSlot(seurat.object, "meta.data")) {
+      get.data <- as.data.frame(seurat.object@meta.data)
+    }
+    if(!is.null(get.data)) {
+      di <- colnames(get.data)
+      m <- grep("res|cluster|Res|Cluster", di, value=T, invert = T) # Put as metadata if it's not the result of a clustering.
+      discrete <- apply(get.data, 2, function(x) length(unique(x)) / length(x))
+      gi <- di[which(discrete <= 0.015)]
+      ds@meta <- get.data[,m,drop=F]
+      ds@group.ids <- get.data[,gi,drop=F]
+    }
+
+    # Copy over var.genes
+    if(length(seurat.object@assays$RNA@var.features > 0)) ds@var.genes <- seurat.object@assays$RNA@var.features
+
+    # Move over tSNE projection
+    if (.hasSlot(seurat.object, "tsne.rot")) {
+      if(!any(dim(seurat.object@tsne.rot) == 0)) {
+        ds@tsne.y <- as.data.frame(seurat.object@tsne.rot)
+        colnames(ds@tsne.y) <- c("tSNE1", "tSNE2")
+      }
+    } else if (.hasSlot(seurat.object, "reductions")) {
+      if(("umap" %in% names(seurat.object@reductions)) && !any(dim(seurat.object@reductions$umap) == 0)) {
+        ds@tsne.y <- as.data.frame(seurat.object@reductions$umap@cell.embeddings)
+        colnames(ds@tsne.y) <- c("tSNE1", "tSNE2")
+      }
+    }
+
+    # Move over PCA results
+    if (.hasSlot(seurat.object, "pca.x")) {
+      if(!any(dim(seurat.object@pca.x) == 0)) {
+        ds@pca.load <- seurat.object@pca.x
+        ds@pca.scores <- seurat.object@pca.rot
+        warning("Need to set which PCs are significant in @pca.sig")
+      }
+      ## TO DO: Convert SVD to sdev
+    } else if (.hasSlot(seurat.object, "reductions")) {
+      if(("pca" %in% names(seurat.object@reductions)) && !any(dim(Loadings(seurat.object, reduction = "pca")) == 0)) {
+        ds@pca.load <- as.data.frame(Loadings(seurat.object, reduction = "pca"))
+        ds@pca.scores <- as.data.frame(seurat.object@reductions$pca@cell.embeddings)
+        ds@pca.sdev <- seurat.object@reductions$pca@stdev
+        ds@pca.sig <- pcaMarchenkoPastur(M=dim(ds@pca.scores)[1], N=dim(ds@pca.load)[1], pca.sdev=ds@pca.sdev)
+      }
+    }
+    return(ds)
+  } else {
+    stop("Package Seurat is required for this function. To install: install.packages('Seurat')\n")
+  }
+}
+
+urd.obj <- SeuratToURDv3(seurat.obj)
+
+#To deal with batch effects, we will use the batch corrected "integrated" data from Seurat to create the URD trajectory.
+#After creating the trajectory, we will use the SCT normalized gene expression for all plots
+urd.obj@logupx.data <- seurat.obj@assays$integrated$data
+
+#Removing Dropseq cells that in initial analyses caused large batch effects.
+urd.obj <- urdSubset(urd.obj, cells.keep = cellsInCluster(urd.obj, "batch", c("10x.bud1", "10x.bud2", "10x.nGreen", "10x.PN")))
+
+#Remove the seurat obj to clear some RAM
+rm(seurat.obj)
+```
+
+# Removing outliers
+
+Before creating a trajectory, we need to remove outliers and doublets. There also may be multiple transdifferentiating events to make ec1E cells, so we will also have to remove some cells from ec1E to represent the most likely route to ec1E cells.
+
+## Removing ouliers based on k-nearest neighbors
+
+Outlier cells are poorly connected to the main data set and often disrupt trajectory reconstruction. Thus, we calculate k-nearest neighbor networks (KNN) and identify outlier cells based on their distance to their nearest neighbors. Here we remove 242 outliers based on KNN networks.
+
+```{r knn-outliers}
+#First, we calculate a list of variable genes
+var.genes <- findVariableGenes(object = urd.obj, set.object.var.genes = F, diffCV.cutoff = 0.45, do.plot = T)
+urd.obj@var.genes <- var.genes
+
+#Calculate k-nearest neighbor networks
+urd.obj <- calcKNN(urd.obj, genes.use = rownames(urd.obj@logupx.data), nn=100)
+
+outliers.knn <- knnOutliers(urd.obj, x.max = 86, slope.r = 0.12, int.r = 79, slope.b = 1.1, int.b = 7.75)
+```
+
+```{r visualize outliers}
+#Because we will remove cells based on several criteria, we will make a list of cells to remove for different reasons that we can plot later:
+cells.remove.list <- list(
+  knn.outliers = outliers.knn
+)
+
+# Visualize outlier cells
+urd.obj <- groupFromCells(urd.obj, group.id = "knn.outliers", cells = outliers.knn)
+
+plotDimHighlight(urd.obj, "knn.outliers", "True", plot.title = "Outliers from k-Nearest Neighbors", highlight.color = "#00BFC4")
+```
+
+## Removing doublets using NMF module co-expression
+
+Doublets are formed at low frequencies when using a droplet-based scRNA-seq technique when multiple cells are encapsulated in a single droplet. Since these can create spurious connections that interfere with trajectory inference, we aimed to remove them by identifying cells with co-expression of typically mutually exclusive gene expression programs (Siebert et al., 2019). To do this, we identify the modules that are cell type specific and use functions in URD to identify thresholds for choosing cells to eliminate based on expression of cell-type specific modules that should not be co-expressed. We exclude ICSs and progenitors from this analysis as they are often co-expressing different modules as thei undergo differentiation.
+
+```{r identify-doublets}
+# Load the broad NMF list from the old urd object.
+# We normalized NMF scores across all cells in the object by scaling such that each module’s expression ranged from 0-1 across all cells in the previous object.
+urd.obj@nmf.c1 <- old.urd.obj@nmf.c1
+
+#Make a plot list of each NMF module to visualize their expression and plot for each.
+plot.list <- lapply(colnames(urd.obj@nmf.c1), function(x) plotDim(urd.obj, x, point.size = 0.5, alpha = 0.75))
+names(plot.list) <- colnames(urd.obj@nmf.c1)
+dir.create("Figures/NMF_umaps")
+for (plot in names(plot.list)) {
+  png(filename = paste0("Figures/NMF_umaps/", plot, ".png"), width = 300*10, height = 300*9, res = 300)
+  print(plot.list[[plot]])
+  dev.off()
+}
+# NMF Modules for for each cluster:
+# en1: 20
+# en2: 21,
+# en3: 1,
+# ec1A: 27
+# ec1B: 4
+# ec1C: 23
+# ec1D: 16
+# ec1E: 8
+# ec2: 14,
+# ec3A: 19,
+# ec3B: 13,
+# ec3C: 13,
+# ec4: 11, 22,
+# ec5: 12
+
+#NMF modules to use for doublet detection:
+nmf.broad.subtype.use <- c("X20", "X21", "X1", "X27", "X4", "X23", "X16", "X8", "X14", "X19", "X13", "X11", "X22", "X12")
+```
+
+Next, we determine overlaps between module pairs. This is performing a pair-wise comparison between each NMF and identifying how many cells express each NMF on their own within a "module threshold". Then, we are looking at the fraction of cells that overlap with both the high and low thresholds between each NMF. There are two thresholds used to determine whether a cell expresses a module: Distinct and Overlapping.
+Distinct is the number of co-expressing cells is similar with either threshold. Overlapping is the number of cells that co-express the modules increase dramatically as the threshold is lowered.
+
+```{r NMF-doublet-identification}
+# considers NMF module expression within cells pairwise
+nmf.doublet.combos <- NMFDoubletsDefineModules(urd.obj, modules.use = nmf.broad.subtype.use, module.thresh.high = 0.3, module.thresh.low = 0.15)
+
+# Plot module overlaps
+NMFDoubletsPlotModuleThresholds(nmf.doublet.combos, frac.overlap.max = 0.07, frac.overlap.diff.max = 0.15)
+```
+
+We identified 1416 doublets, 10 of which were also identified as knn outliers:
+
+```{r visulaize-doublets}
+# Identify cells that express non-overlapping NMF modules, which we assume to be doublets
+nmf.doublets <- NMFDoubletsDetermineCells(urd.obj, nmf.doublet.combos, module.expressed.thresh = 0.2, frac.overlap.max = 0.07, frac.overlap.diff.max = 0.15)
+
+#add to the list of cells to remove:
+cells.remove.list$nmf.doublets <- nmf.doublets
+
+length(nmf.doublets) #1416
+intersect(nmf.doublets, outliers.knn) #10 doublets are also outliers
+
+# Visualize doublets
+urd.obj <- groupFromCells(urd.obj, "doublets", nmf.doublets)
+
+plotDim(urd.obj, "doublets", plot.title = "Cells that express two distinct NMF modules")
+```
+
+### Crop outliers and doublets
+
+```{r remove-doublets-outliers}
+# Crop the data based on nmf doublets and knn outliers:
+cells.remove <- unique(c(outliers.knn, nmf.doublets))
+cells.keep <- setdiff(colnames(urd.obj@logupx.data), cells.remove)
+
+# Visualize The cells to remove:
+urd.obj@group.ids[cells.keep, "cells.to.keep"] <- "keep"
+urd.obj@group.ids[cells.remove, "cells.to.keep"] <- "remove"
+plotDim(urd.obj, "cells.to.keep", plot.title = "Cells to remove (doublets & outliers)")
+
+length(cells.remove) #removing 1648 cells.
+
+# Subset the data
+urd.obj <- urdSubset(urd.obj, cells.keep = cells.keep)
+```
+
+# Calculate Diffusion map and transition matrix
+
+Next we calculate a diffusion map. These parameters were chosen by comparing results from several runs with varying parameters. When selecting the final diffusion map, we looked for (1) strong connections between differentiated neurons and progenitors, and (2) low promiscuity between different groups of terminally differentiated cells that we hypothesized shouldn’t be related (and for which we did not see cells with intermediate gene expression states).
+
+```{r calc-dm}
+dir.create("Figures/Transitions")
+
+# Calculate a new set of variable genes after removing doublets and outlier cells
+var.genes <- findVariableGenes(object = urd.obj, set.object.var.genes = F, diffCV.cutoff = 0.45, do.plot=T)
+
+urd.obj@var.genes <- var.genes
+
+#Calculate PCA:
+urd.obj <- calcPCA(urd.obj, genes.use = rownames(urd.obj@logupx.data), mp.factor = 2)
+
+#Calculate the Diffusion Map:
+urd.obj <- calcDM(urd.obj, genes.use = rownames(urd.obj@logupx.data), knn = 100, sigma.use = 'local', distance = 'cosine')
+
+plotDim(urd.obj, label = "curatedIdent", transitions.plot = 10000, plot.title="knn100, sigma local, cosine (with transitions)", point.size = 0.5, alpha = 0.25)
+
+plotDimArray(urd.obj, reduction.use = "dm", dims.to.plot = 1:16, outer.title = "Diffusion Map (Sigma local, knn100)", label="curatedIdent", plot.title="", legend=F)
+```
+
+# Identify ec1E outliers
+
+The ec1E cluster does not have a clear path from one specific cluster. Because URD works by performing random walks back from tips and determining when walks converge, it is unable to decifer multiple differentiation paths. We will therefore determine the most likely differentiation path of ec1E and may have to remove cells that represent the less likely differentiation paths. From the umap and transition probabilities it looks like ec1E may transdifferentiate from ec1C. Based on their biological locations. This makes sense, but there also appear to be other possible routes for ec1E to differentiate. We will use the diffusion map to quantify the most likely path to ec1E. We also want to determine the most likely path from "early" differentiating ec1C cells vs. "late" differentiated ec1C cells, so we will subcluster the data to determine the early and late ec1C cells.
+
+```{r ec1E-outliers-subclustering}
+#First, we will subcluster cells like we will to find tips, but to identify the "early" and "late" ec1C cells:
+dir.create("Figures/ec1E_outliers")
+
+#Subset the object to idents that may contain tip cells:
+tip.idents <- c("en1", "en2", "en3", "ec2", "ec3A", "ec3B", "ec3C", "ec4A", "ec5", "ec1C", "ec1E", "ec1B", "ec1D")
+
+#subset urd
+subset.obj <- urdSubset(urd.obj, cells.keep = cellsInCluster(urd.obj, clustering = "curatedIdent", cluster = tip.idents))
+
+#perform louvain clustering
+set.seed(1212)
+subset.obj <- graphClustering(subset.obj, do.jaccard = T, method = "Infomap", num.nn = c(120))
+set.seed(1212)
+
+plotDim(subset.obj, label = "Infomap-120", label.clusters = T, legend = F)
+```
+
+```{r ec1E-outliers-plotting-subclusters}
+#Make a list of the ec1C subclusters:
+#ec1C "early" cells = "24", ec1C "late" cells = "20"
+ec1C.cells <- list(
+  early = rownames(subset.obj@group.ids[subset.obj@group.ids$curatedIdent == "ec1C" & subset.obj@group.ids$`Infomap-120` == "24",]),
+  late = rownames(subset.obj@group.ids[subset.obj@group.ids$curatedIdent == "ec1C" & subset.obj@group.ids$`Infomap-120` == "20",])
+)
+#add any other ec1C cells that are not a part of clusters "25" or "20"
+ec1C.cells$other <- setdiff(rownames(urd.obj@group.ids[urd.obj@group.ids$curatedIdent == "ec1C",]), unlist(ec1C.cells))
+
+#add ec1C clustering information to the object:
+urd.obj@group.ids$idents.split.ec1C <- as.character(urd.obj@group.ids$curatedIdent)
+urd.obj@group.ids[ec1C.cells$early, "idents.split.ec1C"] <- "ec1C-early"
+urd.obj@group.ids[ec1C.cells$late, "idents.split.ec1C"] <- "ec1C-late"
+urd.obj@group.ids[ec1C.cells$other,"idents.split.ec1C"] <- "ec1C-other"
+
+plotDim(urd.obj, label = "idents.split.ec1C", label.clusters = T, legend = F)
+table(urd.obj@group.ids$idents.split.ec1C)
+# one cell doesn't fall into either ec1C-early or late, should probably be removed
+```
+
+To identify the most likely path to ec1E, we will take the mean of transitions between each ec1E cell and cells in each cluster. This shows that the highest transition probabilities (unsurprisingly) are between ec1E and other ec1E cells. However, the next highest probabilities are between ec1E and "late" ec1C cells. We therefore believe that the most likely path to ec1E cells is through trans-differentiation of ec1C. However, we want to recognize that based on this quantification, ec1E may also arrise independently from ec1 precursors, and/or trans-differentiate from ec1B. 
+
+```{r tm-colmeans}
+
+#Sum the transition probabilites to/from ec1E cells and other clusters.
+
+# Calculate transition probabilities:
+tm <- floodBuildTM(urd.obj)
+
+#get colmeans for ec1E cells to cells from each other population:
+tm.ec1E <- tm[,rownames(urd.obj@group.ids[urd.obj@group.ids$idents.split.ec1C == "ec1E",])]
+#remove that one weird ec1C-other cell since colMeans() won't work for one cell.
+tm.ec1E<- tm.ec1E[setdiff(rownames(tm.ec1E), ec1C.cells$other),]
+clusters.test <- setdiff(unique(urd.obj@group.ids$idents.split.ec1C), "ec1C-other")
+
+
+#for each celltype, get colmeans of ec1E cells to all cells in that cluster in tm.ec1E:
+ec1E.transition.colmeans <- lapply(clusters.test, function(cluster){
+  cells.compare <- rownames(urd.obj@group.ids[urd.obj@group.ids$idents.split.ec1C == cluster,])
+  return(colMeans(tm.ec1E[cells.compare,]))
+})
+ec1E.transition.colmeans <- Reduce(rbind, ec1E.transition.colmeans)
+rownames(ec1E.transition.colmeans) <- clusters.test
+
+#convert to data.frame for plotting:
+ec1E.transition.colmeans.df <- reshape2::melt(ec1E.transition.colmeans)
+colnames(ec1E.transition.colmeans.df) <- c("curatedIdent", "Cell", "sum.tm")
+#order clusters based on the mean transitions from ec1E:
+plot.ident.order <- sapply(unique(as.character(ec1E.transition.colmeans.df$curatedIdent)), function(x) mean(ec1E.transition.colmeans.df[ec1E.transition.colmeans.df$curatedIdent == x, "sum.tm"]))
+ec1E.transition.colmeans.df$curatedIdent <- factor(ec1E.transition.colmeans.df$curatedIdent, levels = names(plot.ident.order[order(plot.ident.order, decreasing = T)]))
+
+#plot Violin plot of transition probability sums for each cell:
+ggplot(ec1E.transition.colmeans.df, mapping = aes(x = curatedIdent, y = sum.tm)) +
+  geom_violin(aes(fill = curatedIdent), scale = "width") +
+  geom_jitter(size = 0.5, alpha = 0.5, width = 0.33) +
+  scale_fill_manual(values = curated.ident.colors) +
+  theme_bw() +
+  guides(fill = "none") +
+  labs(x = NULL, y = "Mean Transition Probabilities", title = "Mean Transition Probabilities from ec1E to each curatedIdent") +
+  theme(plot.title = element_text(hjust=0.5), axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1))
+```
+
+We are going to remove ec1E cells that have high transition probabilities to clusters other than ec1E or ec1C using a threshold of the mean probability of 2e-05 in clusters other than ec1E or ec1C. We can plot these cells based which cluster (other than ec1E or ec1C) they have the highest transitions to.
+
+```{r remove-ec1E-outliers}
+#get outliers:
+ec1E.outliers <- unique(ec1E.transition.colmeans.df[!(ec1E.transition.colmeans.df$curatedIdent %in% c("ec1E", "ec1C-early", "ec1C-late")) &
+                                                      ec1E.transition.colmeans.df$sum.tm > 2e-05,"Cell"])
+#unfactor so that sapply returns named character with cells as names in the next line:
+ec1E.outliers <- as.character(ec1E.outliers)
+
+#get the curatedIdent with highest transition probablity sum for each cell:
+ec1E.outliers <- sapply(ec1E.outliers, function(cell){
+  df <- ec1E.transition.colmeans.df[!(ec1E.transition.colmeans.df$curatedIdent %in% c("ec1E", "ec1C-early", "ec1C-late")) &
+                                      ec1E.transition.colmeans.df$Cell == cell,]
+  df <- df[order(df$sum.tm, decreasing = T),]
+  return(df[1,"curatedIdent"])
+})
+cells.remove.list$ec1E.outliers <- ec1E.outliers
+
+#add to urd obj and plot:
+urd.obj@group.ids[names(ec1E.outliers),"ec1E.oultiers.max.transition"] <- ec1E.outliers
+
+#Plot the ec1E cells with high transitions outside of ec1E/ec1C:
+  #cells will be colored by the next highest cluster that that cell has transitions to.
+plotDim(urd.obj, "ec1E.oultiers.max.transition",
+        discrete.colors = curated.ident.colors, alpha = 0.75,
+        point.size = 1.5,
+        plot.title = "ec1E oultiers cluster with highest transition probabilites") +
+  scale_color_manual(values = curated.ident.colors, na.value = "#cecece")
+```
+
+We will also remove a few cells from other clusters that make abnormally high connections to the ec1E cells that remain. These are likely doublets that were not captured in the NMF doublet identification.
+
+```{r remove-ouliers-with-transitions-to-ec1E}
+ec1E.transitions.rowmeans<- tm[
+  rownames(urd.obj@group.ids[!urd.obj@group.ids$curatedIdent %in% c("ec1E", "ec1C"),]),
+  rownames(urd.obj@group.ids[urd.obj@group.ids$curatedIdent == "ec1E",])
+]
+ec1E.transitions.rowmeans <- ec1E.transitions.rowmeans[,setdiff(colnames(ec1E.transitions.rowmeans), names(ec1E.outliers))]
+
+#make a dataframe with mean transitions to ec1E for each cell and the cluster that that cell belongs to:
+ec1E.transitions.rowmeans <- rowMeans(ec1E.transitions.rowmeans)
+ec1E.transitions.rowmeans <- data.frame(ec1E.transitions.rowmeans)
+ec1E.transitions.rowmeans$curatedIdent <- urd.obj@group.ids[rownames(ec1E.transitions.rowmeans),"curatedIdent"]
+
+#plot the transitions to ec1E:
+ggplot(data = ec1E.transitions.rowmeans, mapping = aes(x = curatedIdent, y = ec1E.transitions.rowmeans)) +
+  geom_violin(scale = "width", aes(fill = curatedIdent)) +
+  geom_jitter(alpha = 0.5, width = 0.33, aes(color = curatedIdent)) +
+  scale_fill_manual(values = curated.ident.colors) +
+  scale_color_manual(values = curated.ident.colors) +
+  theme_bw() +
+  guides(fill = "none", color = "none") +
+  labs(x = NULL, y = "Mean Transition Probabilities", title = "Mean Transition Probabilities to ec1E from each curatedIdent") +
+  theme(plot.title = element_text(hjust=0.5), axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1))
+
+#Remove cells outside of ec1E and ec1C with high transitions to ec1E:
+ec1E.outliers.rm <- rownames(ec1E.transitions.rowmeans[ec1E.transitions.rowmeans$ec1E.transitions.rowmeans > 5e-05,])
+cells.remove.list$other.cells.with.transitions.to.ec1E <- ec1E.outliers.rm
+
+urd.obj@group.ids[ec1E.outliers.rm,"ec1E.other.cluster.cells.remove"] <- urd.obj@group.ids[ec1E.outliers.rm,"curatedIdent"]
+
+#Plot the cells that will be removed, colored by the cluster that they belong to:
+plotDim(urd.obj, "ec1E.other.cluster.cells.remove",
+        discrete.colors = curated.ident.colors, alpha = 0.75,
+        point.size = 1.5,
+        plot.title = "Other cluster cells with high transitions to ec1E") +
+  scale_color_manual(values = curated.ident.colors, na.value = "#cecece")
+
+#cells to remove include the ec1E outliers as well as cells with high transitions to ec1E:
+ec1E.outliers.rm <- c(ec1E.outliers.rm, names(ec1E.outliers))
+```
+
+Finally, there are a few ec1E cells that have no ec1E NMF module expression but express high ec1B module expression. These may represent doublets or cells that are transdifferentiating from ec1B. We will remove these cells as they will confound pseudotime analysis without transitions between ec1E and ec1B.
+
+```{r remove-high-ec1B-NMF-ec1E-cells}
+
+#Find the cells that have high ec1B module expression:
+X4.module.cells <- urd.obj@nmf.c1[,"X4"]
+X4.module.cells <- X4.module.cells[X4.module.cells > 0.25]
+X4.module.cells <- names(X4.module.cells)
+ec1e.cells.high.X4 <- intersect(rownames(urd.obj@group.ids[urd.obj@group.ids$curatedIdent == "ec1E",]), X4.module.cells)
+cells.remove.list$ec1e.cells.high.X4 <- ec1e.cells.high.X4
+
+#plot ec1e.cells.high.X4:
+urd.obj <- groupFromCells(urd.obj, group.id = "ec1e.cells.high.X4", cells = ec1e.cells.high.X4)
+plotDimHighlight(urd.obj, "ec1e.cells.high.X4", "True", plot.title = "ec1E cells with high ec1B NMF module", highlight.color = "#00BFC4")
+
+#All cells to remove based on:
+  #1: high transitions to clusters other than ec1E/ec1C,
+  #2: high transitions from outside cells to ec1E,
+  #3: high expression of the ec1B specific NMF module
+ec1E.outliers.rm <- unique(c(ec1E.outliers.rm, ec1e.cells.high.X4))
+
+urd.obj <- groupFromCells(urd.obj, group.id = "ec1E.cells.remove", cells = ec1E.outliers.rm)
+plotDimHighlight(urd.obj, "ec1E.cells.remove", "True", plot.title = "ec1E cells to remove", highlight.color = "#00BFC4")
+```
+
+## Re-caculate DM after removing ec1E outliers
+
+Here, we remove the ec1E outliers and re-calculate variable genes, PCA, and the Diffusion Matrix. 
+
+```{r subset-all-ec1E-based-outliers}
+subset.obj <- urdSubset(urd.obj, cells.keep = setdiff(colnames(urd.obj@logupx.data), ec1E.outliers.rm))
+#also subset out the 1 ec1C-other cell:
+subset.obj <- urdSubset(subset.obj, cells.keep = setdiff(colnames(subset.obj@logupx.data),
+                                                         rownames(subset.obj@group.ids[subset.obj@group.ids$idents.split.ec1C == "ec1C-other",])))
+
+#Plot transitions to and from ec1E before removing these cells:
+plotDim(urd.obj, "curatedIdent", point.size = 0.5, alpha = 0.1,
+        transitions.df = edgesFromDM(urd.obj, cells = cellsInCluster(urd.obj, "curatedIdent", "ec1E"), include.connected.cells = T), 
+        legend = F, plot.title = "All ec1E transitions (before outlier removal)")
+
+##Plot transitions to and from ec1E after removing these cells:
+plotDim(subset.obj, "curatedIdent", point.size = 0.5, alpha = 0.1,
+        transitions.df = edgesFromDM(subset.obj, cells = cellsInCluster(subset.obj, "curatedIdent", "ec1E"), include.connected.cells = T),
+        legend = F, plot.title = "All ec1E transitions (after outlier removal)")
+
+#subset the object, rerun var.genes, calcPCA, calcDM:
+
+urd.obj <- subset.obj
+
+var.genes <- findVariableGenes(object = urd.obj, set.object.var.genes = F, diffCV.cutoff = 0.45, do.plot=T)
+urd.obj@var.genes <- var.genes
+urd.obj <- calcPCA(urd.obj, genes.use = rownames(urd.obj@logupx.data), mp.factor = 2)
+urd.obj <- calcDM(urd.obj, genes.use = rownames(urd.obj@logupx.data), knn = 100, sigma.use = 'local', distance = 'cosine')
+```
+
+## Trim ec1E transitions
+
+There are still some transitions to/from ec1E and "early" ec1C cells. This is likely due to early ec1C cells having low ec1C module expression, similar to late trans-differentiating ec1C cells. Because this will cause pseudotime to "skip" the late ec1C cells, it will not properly represent ec1E as a tip. We will therefore set transition probabilities between ec1E and anything other than late ec1C cells to 0 before calculating pseudotime.
+
+```{r trim-ec1E-transitions}
+#get the cells from ec1E and late ec1C that we will keep transitions between:
+dm.cells.keep <- list(
+  ec1E = rownames(urd.obj@group.ids[urd.obj@group.ids$idents.split.ec1C == "ec1E",]),
+  ec1C.late = rownames(urd.obj@group.ids[urd.obj@group.ids$idents.split.ec1C == "ec1C-late",])
+)
+
+#set transition matrix rows and columns from ec1E to anything other than ec1E or ec1C-late to 0
+urd.obj@dm@transitions[dm.cells.keep$ec1E, setdiff(colnames(urd.obj@dm@transitions), unlist(dm.cells.keep))] <- 0
+urd.obj@dm@transitions[setdiff(rownames(urd.obj@dm@transitions), unlist(dm.cells.keep)), dm.cells.keep$ec1E] <- 0
+
+#plot the transitions to and from ec1E after removing outlier cells and trimming ec1E transitions:
+plotDim(urd.obj, "curatedIdent", point.size = 0.5, alpha = 0.1,
+        transitions.df = edgesFromDM(urd.obj, cells = cellsInCluster(urd.obj, "curatedIdent", "ec1E"), include.connected.cells = T),
+        legend = F, plot.title = "All ec1E transitions (after trimming transitions)")
+
+#Plot all transitions across the whole object:
+plotDim(urd.obj, "curatedIdent", point.size = 0.5, alpha = 0.1, transitions.plot = 10000, 
+        legend = T, plot.title = "All transitions (10,000 transitions plotted)")
+```
+
+# Calculate pseudotime
+
+We next calculated pseudotime using the interstitial stem cells (ISCs), as determined by expression of Hydra ISC marker (G002332) (Siebert et al., 2019), as the “root”, or starting point of the tree.
+
+```{r identify-root-cells}
+set.seed(1212)
+#We next calculated pseudotime using the interstitial stem cells, as determined by expression of Hydra ISC marker (G002332) (Siebert et al., 2019), as the “root”, or starting point of the tree.
+dir.create("Figures/Calc_pseudotime")
+
+# Define root cells as anything in the I-cell cluster
+root.cells <- cellsInCluster(urd.obj, "curatedIdent", c("ISC"))
+urd.obj <- groupFromCells(urd.obj, "root", root.cells)
+
+# Plot the root cells
+plotDim(urd.obj, "root", plot.title="Root cells")
+```
+
+
+
+```{r flood-pseudotime, message=F, warning=F}
+floods <- floodPseudotime(urd.obj, root.cells = root.cells, n=50, minimum.cells.flooded = 2, verbose=T)
+
+# The we process the simulations into a pseudotime
+urd.obj <- floodPseudotimeProcess(urd.obj, floods, floods.name="pseudotime")
+
+#We can make sure that enough simulations have been performed by looking at the change in cell pseudotime as more simulations are added. Here, we can see that an asymptote was reached around 40 simulations, so 50 was enough.
+pseudotimePlotStabilityOverall(urd.obj)
+
+#We can also plot pseudotime on the UMAP
+plotDim(urd.obj, "pseudotime", plot.title = "Pseudotime")
+
+#Plotting distribution of pseudotime per cluster:
+plotDists(urd.obj, "pseudotime", "curatedIdent", plot.title="Pseudotime by cluster")
+```
+
+# Determine Tip cells
+
+To perform random walks backwards in pseudotime, we need to determine which cells we will use as tips. Terminal neural populations were chosen from Infomap-Jaccard community detection clustering and tip clusters were selected based on (1) their late pseudotime as assigned by URD and (2) several differentially expressed genes.
+
+```{r determine-tip-cells}
+dir.create("Figures/choosing_tips")
+
+#Define the idents where we want to find tips.
+tip.idents <- c("en1", "en2", "en3", "ec2", "ec3A", "ec3B", "ec3C", "ec4A", "ec5", "ec1C", "ec1E", "ec1B", "ec1D", "ec1A")
+
+#subset urd to those idents, cluster, and find subclusters to use as tips.
+subset.obj <- urdSubset(urd.obj, cells.keep = cellsInCluster(urd.obj, clustering = "curatedIdent", cluster = tip.idents))
+
+#perform louvain clustering
+set.seed(1212)
+subset.obj <- graphClustering(subset.obj, do.jaccard = T, method = "Infomap", num.nn = c(120))
+
+#plot clusters to determine which to use for random walks
+plotDim(subset.obj, "Infomap-120", label.clusters = T, legend = F)
+
+#get subclusters for tips: some may be combined later.
+tip.sub.clusters <- list(ec4A = c("13", "46", "5", "42"),
+                         ec2 = c("1", "44"),
+                         ec1B = c("2", "25", "11"),
+                         ec1E = "45",
+                         ec1C = c("20"),
+                         ec1A = c("22", "4"),
+                         ec1D = "14",
+                         ec5 = c("9", "16"),
+                         en3 = c("39", "6", "40", "37"),
+                         en1 = c("12", "24", "47"),
+                         en2 = c("10", "30", "23", "18"),
+                         ec3A = c("29", "41"),
+                         ec3B = c("8", "36"),
+                         ec3C = c("27", "7")
+)
+
+#add tip clusters to full subset:
+cluster.tip.cells <- cellsInCluster(subset.obj, "Infomap-120", unlist(tip.sub.clusters))
+urd.obj@group.ids[cluster.tip.cells, "tip.clusters"] <- subset.obj@group.ids[cluster.tip.cells, "Infomap-120"]
+
+#plot tip cells:
+plotDim(urd.obj, "tip.clusters", label.clusters = T, legend=F, plot.title="Tip Clusters to test for neuron specific tree")
+```
+
+# Perform random walks
+
+Biased random walks were performed to determine the cells visited from each terminal population in the data. Since Hydra are constantly replenishing their tissues in a homeostatic manner, cell density along developmental processes varies widely, with a large number of transcriptionally similar differentiated cells and much smaller numbers of cells in transition. Thus, we used a larger max.cells.back value in an attempt to force the random walks to visit, and not bypass, cells of similar pseudotime when trajectory reconstruction was proceeding through regions of high cell density.
+
+```{r random-walks, message=F, warning=F}
+dir.create("Figures/Random_walks")
+
+# Bias the transition probabilities by cellular pseudotime
+pt.logistic <- pseudotimeDetermineLogistic(urd.obj, pseudotime="pseudotime", optimal.cells.forward = 0, max.cells.back = 200, pseudotime.direction = "<")
+
+tm.biased <- as.matrix(pseudotimeWeightTransitionMatrix(urd.obj, pseudotime="pseudotime", logistic.params = pt.logistic, pseudotime.direction="<"))
+
+# Simulate the biased random walks from each tip
+walks <- simulateRandomWalksFromTips(urd.obj, tip.group.id = "tip.clusters", root.cells=root.cells, transition.matrix=tm.biased, n.per.tip=50000, root.visits=1, verbose = T)
+
+# Process the biased random walks into visitation frequencies
+urd.obj <- processRandomWalksFromTips(urd.obj, walks, verbose = T)
+```
+
+We can plot visitation frequencies from each sub cluster to determine which sub-clusters we want to use/combine for each neuron cell type. Here we wrote a function to plot all visitation frequencies from each subcluster of a neural type.
+
+```{r determine-tips-to-combine}
+#make a function to create a plot for each curatedIdent showing the visitation frequencies for every subcluster in that ident
+plot.multiple.visitation.freqs <- function(curatedIdent){
+  #make plotlist:
+  tip.clusters.plot <- tip.sub.clusters[[curatedIdent]]
+  plot.list <- lapply(tip.clusters.plot, function(x){
+    #get the visitation column to plot from urd.obj@diff.data
+    visitation.column <- paste0("visitfreq.log.", x)
+    #make plot title:
+    title <- paste0(curatedIdent, ": Log10 Visitation: tip ", x)
+    #make plot:
+    plot <- plotDim(urd.obj, visitation.column, plot.title=title)
+    return(plot)
+  })
+  
+  ncol <- ceiling(sqrt(length(plot.list)))
+  
+  plot <- cowplot::plot_grid(plotlist = plot.list, ncol = ncol)
+  
+  return(plot)
+}
+
+
+plot.multiple.visitation.freqs("ec3C")
+```
+
+# Build the tree
+
+## Combine tip walks
+
+To build the tree, we will combine tips and random walks from the sub-clusters. Because buildTree() is currently destructive, we will make a new object.
+
+```{r tree-obj, message=F, warning=F}
+tree <- loadTipCells(urd.obj, "tip.clusters")
+tree <- processRandomWalksFromTips(tree, walks, verbose = T)
+```
+
+The function combineTipVisitation() will combine random walks from several tips. However, it only combines two walks, and several cell types have multiple tip clusters that we will use. We therefore write a for loop to run combineTipVisitation() iteratively on all sub-clusters being used as tips in each cell type.
+
+```{r combine-tips}
+#Make a list of tips subclusters to use for each curatedIdent:
+tips.use <- list(ec4A = c("13", "5", "42"),
+                 ec2 = c("1", "44"),
+                 ec1B = c("25", "11"),
+                 ec1E = "45",
+                 ec1D = "14",
+                 ec5 = c("9", "16"),
+                 en3 = c("39", "6", "40", "37"),
+                 en1 = c("12", "24"),
+                 en2 = c("10", "30", "23", "18"),
+                 ec3A = c("29", "41"),
+                 ec3B = "8",
+                 ec3C = c("27", "7")
+)
+
+
+
+#make a function to combine tips for each cluster:
+  #using combineTipVisitation() from URD, but it only combines 2 tips at a time, so for clusters where we are combining more than 2 tips, it will run a for loop to iteratively combine each tip.
+combine.multiple.tips <- function(tree.obj, curatedIdent){
+  tips.combine <- tips.use[[curatedIdent]]
+  n.tips <- length(tips.combine)
+  new.tip.name <- tips.combine[1]
+  if(n.tips == 1) return(tree.obj) else{
+    for(i in 2:n.tips){
+      tree.obj <- combineTipVisitation(tree.obj, new.tip.name, tips.combine[i], new.tip = new.tip.name)
+    }
+    return(tree.obj)
+  }
+}
+
+#Run it on each cluster
+for(x in names(tips.use)){
+  tree <- combine.multiple.tips(tree.obj = tree, curatedIdent = x)
+}
+
+#get tip names of combined tips:
+tip.names <- sapply(names(tips.use), function(x) return(tips.use[[x]][1]))
+
+#make a new plot showing tip cells used:
+tree@group.ids$final.tips <- NA
+for(t in tip.names){
+  tree@group.ids[tree@tree$cells.in.tip[[t]], "final.tips"] <- t
+}
+
+#plot final tip cells:
+plotDim(tree, "final.tips", label.clusters = T, legend=F, plot.title="Tip Clusters combined to use in Tree")
+```
+
+## Build the tree
+
+Here, we use the combined random walks to build the final trajectory tree.
+
+```{r build-tree, message=F, warning=F}
+
+tips.build <- tip.names[c("ec4A", "ec2", "ec5", "en3", "en1", "en2", "ec3A", "ec3B", "ec3C", "ec1E", "ec1D", "ec1B")]
+
+tree <- buildTree(tree, pseudotime="pseudotime", divergence.method = "preference", save.all.breakpoint.info = T, tips.use=tips.build, cells.per.pseudotime.bin=25, bins.per.pseudotime.window=5, p.thresh=1e-6, min.cells.per.segment=10, save.breakpoint.plots = NULL, verbose=T)
+
+tree <- nameSegments(tree, segments = tips.build, segment.names=names(tips.build), short.names=names(tips.build))
+
+plotTree(tree, label = "curatedIdent", discrete.colors = curated.ident.colors)
+```
+
+Now that the tree has been built, we will replace the Seurat batch corrected data with the SCT normalized data.
+
+```{r add-RNA-data}
+#reload seurat object:
+seurat.obj <- readRDS("/data/CSD/Michael/hydra/objects/hydra.neuron.seurat_updated.HML.RDS")
+#add SCT data:
+tree@logupx.data <- seurat.obj@assays$SCT$data[,colnames(tree@logupx.data)]
+```
+
+# Plotting
+
+## Gene expression
+
+We can plot gene gene expression along the tree:
+```{r plot-individual-GEX}
+plotTree(tree, "G022640", title = "gata3 (G022640)") |
+  plotTree(tree, "G004115", title = "hym355 (G004115)")
+```
+
+To plot dual gene expression along the tree as can be seen in the paper, we use a function that will be implemented in future versions of URD:
+
+```{r plot-dual-GEX-function}
+
+#Dual color plot function:
+
+#This Function takes a dataframe with two genes scaled from 0-1, two color hues, and finds the hue that represents the average of their expression / cell.
+dual.color.transformation.greymix <- function(x, color.1, color.2, base.grey = 0.8) {
+  x$r <- scales::rescale(sqrt(x$gene.1.scaled^2 + x$gene.2.scaled^2), to = c(0,1))
+  x$theta <- atan2(x$gene.2.scaled, x$gene.1.scaled)
+  x$hue <- (x$theta / (pi/2) * (color.2 - color.1)) + color.1
+  x[x$hue >= 360, "hue"] <- x[x$hue >= 360, "hue"] - 360
+  x.bold.color <- as(colorspace::HSV(S = 1, H = x$hue, V = 1), "RGB")
+  x <- cbind(x, as(colorspace::HSV(S = 1, H = x$hue, V = 1), "RGB")@coords)
+  x$R.use <- (x$r * x$R) + ((1-x$r) * base.grey)
+  x$G.use <- (x$r * x$G) + ((1-x$r) * base.grey)
+  x$B.use <- (x$r * x$B) + ((1-x$r) * base.grey)
+  x$color <- rgb(red = x$R.use, green = x$G.use, blue = x$B.use, alpha = 1)
+  return(x)
+}
+
+#This function is building off of plotTreeDual() but using dual.color.transformation.greymix() to plot the two genes instead of just using rgb values.
+plotTreeDual.recolored <- function(object, label.1, label.2, label.1.legend = label.1, label.2.legend = label.2,  label.type.1="search", label.type.2="search", color.1 =  240, color.2 = 390, title=NULL, legend=T, legend.title="", plot.tree=T, tree.alpha=1, tree.size=1, plot.cells=T, cell.alpha=0.25, cell.size=0.5, label.x=T, label.segments=F, color.tree=T, color.limits.1=NULL, color.limits.2=NULL, hide.y.ticks=T,  legend.size = 1/5.5, legend.offset.x = 0, legend.offset.y = 0, legend.position = "UR") {
+
+  # Validation of parameters
+  if (class(object) != "URD") stop("Must provide an URD object as input to plotTree.")
+  if (length(object@tree) == 0) stop("A tree has not been calculated for this URD object. buildTree must be run first.")
+
+  # Grab various layouts from the object
+  segment.layout <- object@tree$segment.layout
+  tree.layout <- object@tree$tree.layout
+  if (plot.cells) cell.layout <- object@tree$cell.layout
+
+  # Create title if needed
+  if (is.null(title)) title <- paste(label.1.legend, " vs.", label.2.legend)
+
+  # Initialize ggplot and do basic formatting
+  the.plot <- ggplot()
+  if (hide.y.ticks) {
+    the.plot <- the.plot + scale_y_reverse(c(1,0), name="Pseudotime", breaks=NULL)
+  } else {
+    the.plot <- the.plot + scale_y_reverse(c(1,0), name="Pseudotime", breaks=seq(0, 1, 0.1))
+  }
+  the.plot <- the.plot + theme_bw() + theme(axis.ticks=element_blank(), panel.grid.major=element_blank(), panel.grid.minor=element_blank())
+  the.plot <- the.plot + labs(x="", title=title, color=legend.title)
+
+  # Grab data to color by
+  label.1.data <- data.for.plot(object, label=label.1, label.type=label.type.1, as.color=F, as.discrete.list = T, cells.use=rownames(object@diff.data))
+  label.2.data <- data.for.plot(object, label=label.2, label.type=label.type.2, as.color=F, as.discrete.list = T, cells.use=rownames(object@diff.data))
+  if (label.1.data$discrete || label.2.data$discrete) stop("Cannot use discrete labels in dual-color plots.")
+  color.data <- data.frame(cell=rownames(object@diff.data), gene.1=label.1.data$data, gene.2=label.2.data$data, node=object@diff.data[,"node"], stringsAsFactors=F)
+
+  #Get the color values:
+  # Build out the color values for these data
+  label.1.max <- quantile(color.data$gene.1[color.data$gene.1 > 0], prob=0.975, na.rm=T)
+  label.2.max <- quantile(color.data$gene.2[color.data$gene.2 > 0], prob=0.975, na.rm=T)
+  if(is.na(label.1.max)) label.1.max <- 1
+  if(is.na(label.2.max)) label.2.max <- 1
+  color.data$gene.1.scaled <- scales::squish(scales::rescale(color.data$gene.1, from=c(0,label.1.max)), c(0,1))
+  color.data$gene.2.scaled <- scales::squish(scales::rescale(color.data$gene.2, from=c(0,label.2.max)), c(0,1))
+
+  #get colors for cells:
+  color.data <- dual.color.transformation.greymix(x = color.data, color.1 = color.1, color.2 = color.2)
+
+
+  #get the color for nodes:
+  if (plot.tree) {
+    # Mean expression per node
+    node.data <- aggregate(color.data[,c("gene.1", "gene.2")], by=list(color.data$node), FUN=mean.of.logs)
+    rownames(node.data) <- node.data$Group.1
+    node.data$n <- unlist(lapply(object@tree$cells.in.nodes, length))[node.data$Group.1]
+
+    # Color segments according to their expression of their end node
+    # (Replace -0 nodes with -1 for getting expression data.)
+    tree.layout$node.1 <- gsub("-0","-1",tree.layout$node.1)
+    tree.layout$node.2 <- gsub("-0","-1",tree.layout$node.2)
+    tree.layout[,"gene.1"] <- node.data[tree.layout$node.2,"gene.1"]
+    tree.layout[,"gene.2"] <- node.data[tree.layout$node.2,"gene.2"]
+
+    #scale the data:
+    tree.layout$gene.1.scaled <- scales::squish(scales::rescale(tree.layout$gene.1, from=c(0,label.1.max)), c(0,1))
+    tree.layout$gene.2.scaled <- scales::squish(scales::rescale(tree.layout$gene.2, from=c(0,label.2.max)), c(0,1))
+
+    #merge the colors:
+    tree.layout <- dual.color.transformation.greymix(x = tree.layout, color.1 = color.1, color.2 = color.2)
+  }
+
+
+  # Add cells to graph
+  if (plot.cells) {
+    cell.layout$color <- color.data[cell.layout$cell, "color"]
+    the.plot <- the.plot + geom_point(data=cell.layout, aes(x=x,y=y), color=cell.layout$color, alpha=cell.alpha, size=cell.size)
+  }
+
+  # Add tree to graph
+  if (plot.tree) {
+    if (color.tree) {
+      # With color, if desired
+      the.plot <- the.plot + geom_segment(data=tree.layout, aes(x=x1, y=y1, xend=x2, yend=y2), color=tree.layout$color, alpha=tree.alpha, size=tree.size, lineend="square")
+    } else {
+      # Just plain black if no label
+      the.plot <- the.plot + geom_segment(data=tree.layout, aes(x=x1, y=y1, xend=x2, yend=y2), color='#333333', alpha=tree.alpha, size=tree.size, lineend="square")
+    }
+  }
+
+  #add legend
+  if(legend){
+    if(plot.cells){
+      legend.data <- cell.layout
+    }else if(plot.tree){
+      legend.data <- tree.layout
+    }
+    #Make legend:
+    if (legend.position %in% c("UR", "LR")) {
+      leg.x.max <- max(legend.data[,"x"]) + legend.offset.x
+      leg.x.min <- leg.x.max - (diff(range(legend.data[,"x"])) * legend.size) + legend.offset.x
+    } else {
+      leg.x.min <- min(legend.data[,"x"]) - legend.offset.x
+      leg.x.max <- leg.x.min + (diff(range(legend.data[,"x"])) * legend.size) - legend.offset.x
+    }
+    if (legend.position %in% c("LR", "LL")) {
+      leg.y.min <- max(legend.data[,"y"]) - legend.offset.y
+      leg.y.max <- leg.y.min - (diff(range(legend.data[,"y"])) * legend.size) + legend.offset.y
+    } else {
+      leg.y.max <- min(legend.data[,"y"]) + legend.offset.y
+      leg.y.min <- leg.y.max + (diff(range(legend.data[,"y"])) * legend.size) - legend.offset.y
+    }
+
+    # Fill in the rest of the legend.
+    leg.gene.1 <- round(seq(0,label.1.max, length.out = 6), digits = 2)
+    leg.gene.2 <- round(seq(0,label.2.max, length.out = 6), digits = 2)
+    leg.gene.scaled <- seq(0,1,length.out = 6)
+    leg.x.breaks <- seq(leg.x.min, leg.x.max, length.out=10)
+    leg.y.breaks <- seq(leg.y.min, leg.y.max, length.out=10)
+    legend.squares <- data.frame(stringsAsFactors=F,
+                                 gene.1 = rep(leg.gene.1, each = 6),
+                                 gene.2 = rep(leg.gene.2, 6),
+                                 gene.1.scaled = rep(leg.gene.scaled, each = 6),
+                                 gene.2.scaled = rep(leg.gene.scaled, 6),
+                                 x.1=rep(leg.x.breaks[2:7], each=6),
+                                 x.2=rep(leg.x.breaks[3:8], each=6),
+                                 y.1=rep(leg.y.breaks[2:7], 6),
+                                 y.2=rep(leg.y.breaks[3:8], 6)
+    )
+    legend.squares <- dual.color.transformation.greymix(x = legend.squares, color.1 = color.1, color.2 = color.2)
+    side.labels <- data.frame(stringsAsFactors=F,
+                              label.x=c(leg.x.breaks[2:7],rep(leg.x.breaks[8], 6)),
+                              label.y=c(rep(leg.y.breaks[8], 6), leg.y.breaks[2:7]),
+                              label.text=as.character(c(leg.gene.1,leg.gene.2))
+    )
+    side.labels$label.x <- side.labels$label.x + (0.5*(leg.x.breaks[2]-leg.x.breaks[1]))
+    side.labels$label.y <- side.labels$label.y + (0.5*(leg.y.breaks[2]-leg.y.breaks[1]))
+    side.labels$angle <- c(rep(90,6), rep(0,6)); side.labels$hjust <- 0; side.labels$vjust <- 0.5; side.labels$size <- 2.5
+    side.labels <- rbind(side.labels, c(leg.x.breaks[5], leg.y.breaks[1], 0, 0, 0.5, 0.5, 4))
+    side.labels <- rbind(side.labels, c(leg.x.breaks[1], leg.y.breaks[5], 0, 90, 0.5, 0.5, 4))
+    side.labels[13:14, "label.text"] <- c(label.1.legend, label.2.legend)
+    side.labels$color <- c(rep("black", 12), legend.squares[31, "color"], legend.squares[6, "color"])
+
+
+    the.plot <- the.plot + geom_rect(legend.squares, mapping = aes(xmin=x.1, xmax=x.2, ymin=y.1, max=y.2), fill=legend.squares$color)
+    the.plot <- the.plot + geom_text(data=side.labels, mapping = aes(label=label.text, x=label.x, y=label.y), angle=side.labels$angle, hjust=side.labels$hjust, vjust=side.labels$vjust, size=side.labels$size, color = side.labels$color)
+  }
+
+
+
+  # Add color
+  the.plot <- the.plot + scale_color_identity()
+
+  # Label segment names along the x-axis?
+  if (label.x) {
+    if ("segment.names" %in% names(object@tree)) {
+      # Add segment names to segment.layout
+      segment.layout$name <- object@tree$segment.names[segment.layout$segment]
+      tip.layout <- segment.layout[complete.cases(segment.layout),]
+    } else {
+      # Find terminal tips
+      tip.layout <- segment.layout[which(segment.layout$segment %in% object@tree$tips),]
+      tip.layout$name <- as.character(tip.layout$segment)
+    }
+    the.plot <- the.plot + scale_x_continuous(breaks=as.numeric(tip.layout$x), labels=as.character(tip.layout$name))
+    if (any(unlist(lapply(tip.layout$name, nchar)) > 2)) {
+      the.plot <- the.plot + theme(axis.text.x = element_text(angle = 68, vjust = 1, hjust=1))
+    }
+  } else {
+    the.plot <- the.plot + theme(axis.text.x=element_blank())
+  }
+
+  # Label the segments with their number?
+  if (label.segments) {
+    segment.labels <- as.data.frame(segment.layout[,c("segment","x")])
+    segment.labels$y <- apply(object@tree$segment.pseudotime.limits, 1, num.mean)[segment.labels$segment]
+    the.plot <- the.plot + geom_label(data=segment.labels, aes(x=x, y=y, label=segment), alpha=0.5)
+  }
+
+  return(the.plot)
+}
+```
+
+
+```{r dual-GEX-plot}
+#plot dual expression of gata3 and hym355:
+plotTreeDual.recolored(object = tree, label.1 = "G022640", label.2 = "G004115",
+                                 label.1.legend = "gata3", label.2.legend = "hym355",
+                                 cell.size = 0.75, cell.alpha = 0.5, legend.position = "LR")
+```
+
+## Spline plots
+
+We can also plot gene expression from root cells to a specified tip. To do this you will need to identify the segments along the tree from the root to the tip.
+
+```{r plot-segments}
+#label tree by segments
+plotTree(tree, "segment", label.segments = T)
+```
+
+
+```{r spline-plot}
+
+genes.plot <- c(
+  myb = "G020130",
+  bhlha15 = "G021353",
+  gata3 = "G022640",
+  hym355 = "G004115",
+  ec3A.marker = "G021930"
+)
+
+#calculate average gene expression across a moving window:
+progen.to.ec3A.spline <-  geneSmoothFit(tree, method = "spline", pseudotime = "pseudotime", cells = cellsInCluster(tree, "segment", c("56", "53", "48", "29")), genes = genes.plot, moving.window = 1, cells.per.window = 5, spar=0.875)
+
+plotSmoothFit(progen.to.ec3A.spline, genes = genes.plot, scaled = T, multiplot = F, alpha.data = .2, plot.title = NULL) +
+  scale_color_manual(values=c(G020130 = "forestgreen",
+                              G021353 = "cornflowerblue",
+                              G022640 = "#BC4643",
+                              G004115 = "darkorchid",
+                              G021930 = "goldenrod3"))
+```
+
